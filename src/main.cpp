@@ -33,7 +33,9 @@ struct Options {
     std::optional<ParsedNumber> start;
     std::optional<ParsedNumber> end;
     std::optional<ParsedNumber> embed;
+    int unitBits = 8;
     int widthBits = 32;
+    bool checkRemainder = false;
     Endian endian = Endian::Little;
     bool showHelp = false;
 };
@@ -44,7 +46,9 @@ struct ResolvedOptions {
     std::uint64_t start = 0;
     std::uint64_t endExclusive = 0;
     std::optional<std::uint64_t> embedOffset;
+    int unitBits = 8;
     int widthBits = 32;
+    bool checkRemainder = false;
     Endian endian = Endian::Little;
 };
 
@@ -57,10 +61,12 @@ std::string usage()
 {
     return
         "Usage:\n"
-        "  checksumTool.exe -f <file> [-s <start>] [-e <end>] [-u 8|16|32] [-m <offset>] [-n L|B]\n\n"
+        "  checksumTool.exe -f <file> [-s <start>] [-e <end>] [-b 8|16|32] [-u 8|16|32] [-m <offset>] [-n L|B] [-c 0|1]\n\n"
         "Addresses accept decimal or 0x-prefixed hexadecimal values.\n"
-        "A negative -e value is resolved from the end of file as an exclusive end offset.\n"
-        "A negative -m value is resolved from the end of file as the write offset.\n";
+        "-e is an inclusive end address. A negative -e value is resolved from the end of file.\n"
+        "A negative -m value is resolved from the end of file as the write offset.\n"
+        "-b selects the checksum calculation unit. -n applies to both calculation and embedding.\n"
+        "-c selects remainder handling. 0 pads with zeroes, 1 treats remainders as errors.\n";
 }
 
 bool iequals(std::string_view lhs, std::string_view rhs)
@@ -141,6 +147,27 @@ std::string requireValue(int argc, char* argv[], int& index, std::string_view op
     return argv[index];
 }
 
+int parseBitOption(std::string_view value, std::string_view optionName)
+{
+    const auto parsed = parseNumber(value, optionName);
+    if (parsed.negative) {
+        fail(std::string(optionName) + " must be 8, 16, or 32");
+    }
+    if (parsed.magnitude != 8 && parsed.magnitude != 16 && parsed.magnitude != 32) {
+        fail(std::string(optionName) + " must be 8, 16, or 32");
+    }
+    return static_cast<int>(parsed.magnitude);
+}
+
+bool parseRemainderCheckOption(std::string_view value)
+{
+    const auto parsed = parseNumber(value, "-c");
+    if (parsed.negative || (parsed.magnitude != 0 && parsed.magnitude != 1)) {
+        fail("-c must be 0 or 1");
+    }
+    return parsed.magnitude == 1;
+}
+
 Options parseArguments(int argc, char* argv[])
 {
     Options options;
@@ -169,15 +196,12 @@ Options parseArguments(int argc, char* argv[])
                 fail("-e was specified more than once");
             }
             options.end = parseNumber(requireValue(argc, argv, i, "-e"), "-e");
+        } else if (arg == "-b") {
+            options.unitBits = parseBitOption(requireValue(argc, argv, i, "-b"), "-b");
         } else if (arg == "-u") {
-            const auto parsed = parseNumber(requireValue(argc, argv, i, "-u"), "-u");
-            if (parsed.negative) {
-                fail("-u must be 8, 16, or 32");
-            }
-            if (parsed.magnitude != 8 && parsed.magnitude != 16 && parsed.magnitude != 32) {
-                fail("-u must be 8, 16, or 32");
-            }
-            options.widthBits = static_cast<int>(parsed.magnitude);
+            options.widthBits = parseBitOption(requireValue(argc, argv, i, "-u"), "-u");
+        } else if (arg == "-c") {
+            options.checkRemainder = parseRemainderCheckOption(requireValue(argc, argv, i, "-c"));
         } else if (arg == "-m") {
             if (options.embed.has_value()) {
                 fail("-m was specified more than once");
@@ -218,19 +242,22 @@ std::uint64_t resolveNonNegativeOffset(
     return number.magnitude;
 }
 
-std::uint64_t resolveEndOffset(const ParsedNumber& number, std::uint64_t fileSize)
+std::uint64_t resolveEndExclusiveOffset(const ParsedNumber& number, std::uint64_t fileSize)
 {
     if (!number.negative) {
-        if (number.magnitude > fileSize) {
+        if (number.magnitude >= fileSize) {
             fail("-e is beyond the end of the file");
         }
-        return number.magnitude;
+        return number.magnitude + 1U;
     }
 
     if (number.magnitude > fileSize) {
         fail("-e negative offset is larger than the file size");
     }
-    return fileSize - number.magnitude;
+    if (number.magnitude == 0) {
+        fail("-e negative offset must be at least 1");
+    }
+    return fileSize - number.magnitude + 1U;
 }
 
 std::uint64_t resolveEmbedOffset(const ParsedNumber& number, std::uint64_t fileSize, std::uint64_t byteCount)
@@ -264,7 +291,9 @@ ResolvedOptions resolveOptions(const Options& options)
 {
     ResolvedOptions resolved;
     resolved.filePath = options.filePath;
+    resolved.unitBits = options.unitBits;
     resolved.widthBits = options.widthBits;
+    resolved.checkRemainder = options.checkRemainder;
     resolved.endian = options.endian;
 
     std::error_code error;
@@ -285,11 +314,20 @@ ResolvedOptions resolveOptions(const Options& options)
         ? resolveNonNegativeOffset(*options.start, resolved.fileSize, "-s")
         : 0;
     resolved.endExclusive = options.end
-        ? resolveEndOffset(*options.end, resolved.fileSize)
+        ? resolveEndExclusiveOffset(*options.end, resolved.fileSize)
         : resolved.fileSize;
 
+    if (options.end && !options.end->negative && options.end->magnitude < resolved.start) {
+        fail("-e resolves before -s");
+    }
     if (resolved.endExclusive < resolved.start) {
         fail("-e resolves before -s");
+    }
+
+    const auto rangeSize = resolved.endExclusive - resolved.start;
+    const auto unitByteCount = static_cast<std::uint64_t>(resolved.unitBits / 8);
+    if (resolved.checkRemainder && rangeSize % unitByteCount != 0) {
+        fail("Checksum range size must be a multiple of the -b calculation unit");
     }
 
     const auto byteCount = static_cast<std::uint64_t>(resolved.widthBits / 8);
@@ -309,7 +347,28 @@ std::uint64_t maskForWidth(int widthBits)
     return (std::uint64_t{1} << widthBits) - 1U;
 }
 
-std::uint64_t calculateChecksum(const std::filesystem::path& filePath, std::uint64_t start, std::uint64_t endExclusive)
+std::uint64_t readUnit(const char* data, std::size_t unitByteCount, Endian endian)
+{
+    std::uint64_t value = 0;
+    if (endian == Endian::Little) {
+        for (std::size_t i = 0; i < unitByteCount; ++i) {
+            value |= static_cast<std::uint64_t>(static_cast<unsigned char>(data[i])) << (8U * i);
+        }
+    } else {
+        for (std::size_t i = 0; i < unitByteCount; ++i) {
+            value = (value << 8U) | static_cast<unsigned char>(data[i]);
+        }
+    }
+    return value;
+}
+
+std::uint64_t calculateChecksum(
+    const std::filesystem::path& filePath,
+    std::uint64_t start,
+    std::uint64_t endExclusive,
+    int unitBits,
+    Endian endian,
+    bool checkRemainder)
 {
     std::ifstream input(filePath, std::ios::binary);
     if (!input) {
@@ -323,6 +382,7 @@ std::uint64_t calculateChecksum(const std::filesystem::path& filePath, std::uint
 
     std::uint64_t sum = 0;
     std::uint64_t remaining = endExclusive - start;
+    const auto unitByteCount = static_cast<std::size_t>(unitBits / 8);
     std::array<char, 64 * 1024> buffer{};
 
     while (remaining > 0) {
@@ -334,9 +394,20 @@ std::uint64_t calculateChecksum(const std::filesystem::path& filePath, std::uint
         if (readCount <= 0) {
             fail("Could not read the requested checksum range");
         }
+        if (checkRemainder && static_cast<std::uint64_t>(readCount) % unitByteCount != 0) {
+            fail("Read size was not aligned to the checksum calculation unit");
+        }
 
-        for (std::streamsize i = 0; i < readCount; ++i) {
-            sum += static_cast<unsigned char>(buffer[static_cast<std::size_t>(i)]);
+        for (std::streamsize i = 0; i < readCount; i += static_cast<std::streamsize>(unitByteCount)) {
+            std::array<char, 4> unit{};
+            const auto available = std::min<std::streamsize>(
+                static_cast<std::streamsize>(unitByteCount),
+                readCount - i);
+            std::copy_n(
+                buffer.begin() + static_cast<std::ptrdiff_t>(i),
+                static_cast<std::size_t>(available),
+                unit.begin());
+            sum += readUnit(unit.data(), unitByteCount, endian);
         }
 
         remaining -= static_cast<std::uint64_t>(readCount);
@@ -404,8 +475,15 @@ void printResult(const ResolvedOptions& options, std::uint64_t checksum)
 {
     const int hexDigits = options.widthBits / 4;
     std::cout << "checksum: " << hexValue(checksum, hexDigits) << " (" << checksum << ")\n";
-    std::cout << "range: [" << hexValue(options.start) << ", " << hexValue(options.endExclusive) << ")\n";
+    if (options.endExclusive > options.start) {
+        std::cout << "range: start " << hexValue(options.start)
+                  << ", end " << hexValue(options.endExclusive - 1U) << " (inclusive)\n";
+    } else {
+        std::cout << "range: empty at " << hexValue(options.start) << "\n";
+    }
+    std::cout << "unit: " << options.unitBits << " bit\n";
     std::cout << "width: " << options.widthBits << " bit\n";
+    std::cout << "remainder: " << (options.checkRemainder ? "error" : "zero-pad") << "\n";
 
     if (options.embedOffset) {
         std::cout << "embedded: offset " << hexValue(*options.embedOffset)
@@ -425,7 +503,13 @@ int main(int argc, char* argv[])
         }
 
         const auto resolved = resolveOptions(options);
-        const auto rawChecksum = calculateChecksum(resolved.filePath, resolved.start, resolved.endExclusive);
+        const auto rawChecksum = calculateChecksum(
+            resolved.filePath,
+            resolved.start,
+            resolved.endExclusive,
+            resolved.unitBits,
+            resolved.endian,
+            resolved.checkRemainder);
         const auto checksum = rawChecksum & maskForWidth(resolved.widthBits);
 
         if (resolved.embedOffset) {
