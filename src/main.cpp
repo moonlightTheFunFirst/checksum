@@ -36,6 +36,7 @@ struct Options {
     int unitBits = 8;
     int widthBits = 32;
     bool checkRemainder = false;
+    bool carryFold = false;
     Endian endian = Endian::Little;
     bool showHelp = false;
 };
@@ -49,6 +50,7 @@ struct ResolvedOptions {
     int unitBits = 8;
     int widthBits = 32;
     bool checkRemainder = false;
+    bool carryFold = false;
     Endian endian = Endian::Little;
 };
 
@@ -61,12 +63,13 @@ std::string usage()
 {
     return
         "Usage:\n"
-        "  checksumTool.exe -f <file> [-s <start>] [-e <end>] [-b 8|16|32] [-u 8|16|32] [-m <offset>] [-n L|B] [-c 0|1]\n\n"
+        "  checksumTool.exe -f <file> [-s <start>] [-e <end>] [-b 8|16|32] [-u 8|16|32] [-m <offset>] [-n L|B] [-c 0|1] [-r 0|1]\n\n"
         "Addresses accept decimal or 0x-prefixed hexadecimal values.\n"
         "-e is an inclusive end address. A negative -e value is resolved from the end of file.\n"
         "A negative -m value is resolved from the end of file as the write offset.\n"
         "-b selects the checksum calculation unit. -n applies to both calculation and embedding.\n"
-        "-c selects remainder handling. 0 pads with zeroes, 1 treats remainders as errors.\n";
+        "-c selects remainder handling. 0 pads with zeroes, 1 treats remainders as errors.\n"
+        "-r selects carry folding. 0 disables it, 1 enables it.\n";
 }
 
 bool iequals(std::string_view lhs, std::string_view rhs)
@@ -159,11 +162,11 @@ int parseBitOption(std::string_view value, std::string_view optionName)
     return static_cast<int>(parsed.magnitude);
 }
 
-bool parseRemainderCheckOption(std::string_view value)
+bool parseBinaryOption(std::string_view value, std::string_view optionName)
 {
-    const auto parsed = parseNumber(value, "-c");
+    const auto parsed = parseNumber(value, optionName);
     if (parsed.negative || (parsed.magnitude != 0 && parsed.magnitude != 1)) {
-        fail("-c must be 0 or 1");
+        fail(std::string(optionName) + " must be 0 or 1");
     }
     return parsed.magnitude == 1;
 }
@@ -201,7 +204,9 @@ Options parseArguments(int argc, char* argv[])
         } else if (arg == "-u") {
             options.widthBits = parseBitOption(requireValue(argc, argv, i, "-u"), "-u");
         } else if (arg == "-c") {
-            options.checkRemainder = parseRemainderCheckOption(requireValue(argc, argv, i, "-c"));
+            options.checkRemainder = parseBinaryOption(requireValue(argc, argv, i, "-c"), "-c");
+        } else if (arg == "-r") {
+            options.carryFold = parseBinaryOption(requireValue(argc, argv, i, "-r"), "-r");
         } else if (arg == "-m") {
             if (options.embed.has_value()) {
                 fail("-m was specified more than once");
@@ -294,6 +299,7 @@ ResolvedOptions resolveOptions(const Options& options)
     resolved.unitBits = options.unitBits;
     resolved.widthBits = options.widthBits;
     resolved.checkRemainder = options.checkRemainder;
+    resolved.carryFold = options.carryFold;
     resolved.endian = options.endian;
 
     std::error_code error;
@@ -347,6 +353,15 @@ std::uint64_t maskForWidth(int widthBits)
     return (std::uint64_t{1} << widthBits) - 1U;
 }
 
+std::uint64_t foldCarry(std::uint64_t value, int widthBits)
+{
+    const auto mask = maskForWidth(widthBits);
+    while (value > mask) {
+        value = (value & mask) + (value >> widthBits);
+    }
+    return value;
+}
+
 std::uint64_t readUnit(const char* data, std::size_t unitByteCount, Endian endian)
 {
     std::uint64_t value = 0;
@@ -367,8 +382,10 @@ std::uint64_t calculateChecksum(
     std::uint64_t start,
     std::uint64_t endExclusive,
     int unitBits,
+    int widthBits,
     Endian endian,
-    bool checkRemainder)
+    bool checkRemainder,
+    bool carryFold)
 {
     std::ifstream input(filePath, std::ios::binary);
     if (!input) {
@@ -408,6 +425,9 @@ std::uint64_t calculateChecksum(
                 static_cast<std::size_t>(available),
                 unit.begin());
             sum += readUnit(unit.data(), unitByteCount, endian);
+            if (carryFold) {
+                sum = foldCarry(sum, widthBits);
+            }
         }
 
         remaining -= static_cast<std::uint64_t>(readCount);
@@ -484,6 +504,7 @@ void printResult(const ResolvedOptions& options, std::uint64_t checksum)
     std::cout << "unit: " << options.unitBits << " bit\n";
     std::cout << "width: " << options.widthBits << " bit\n";
     std::cout << "remainder: " << (options.checkRemainder ? "error" : "zero-pad") << "\n";
+    std::cout << "carry: " << (options.carryFold ? "fold" : "none") << "\n";
 
     if (options.embedOffset) {
         std::cout << "embedded: offset " << hexValue(*options.embedOffset)
@@ -508,8 +529,10 @@ int main(int argc, char* argv[])
             resolved.start,
             resolved.endExclusive,
             resolved.unitBits,
+            resolved.widthBits,
             resolved.endian,
-            resolved.checkRemainder);
+            resolved.checkRemainder,
+            resolved.carryFold);
         const auto checksum = rawChecksum & maskForWidth(resolved.widthBits);
 
         if (resolved.embedOffset) {
